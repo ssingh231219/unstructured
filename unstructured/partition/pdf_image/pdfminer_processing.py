@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, BinaryIO, Iterable, List, Optional, Union, cast
 
 import numpy as np
@@ -38,6 +39,19 @@ if TYPE_CHECKING:
 EPSILON_AREA = 0.01
 # rounding floating point to nearest machine precision
 DEFAULT_ROUND = 15
+
+
+@dataclass(slots=True)
+class PDFMinerPageData:
+    """Compact, PDFMiner-independent data retained from a single page extraction."""
+
+    width: float
+    height: float
+    element_coords: np.ndarray
+    texts: np.ndarray
+    element_class_ids: np.ndarray
+    is_extracted_array: np.ndarray
+    links: list[dict[str, Any]]
 
 
 def process_file_with_pdfminer(
@@ -463,8 +477,7 @@ def text_is_embedded(obj, threshold=env_config.PDF_MAX_EMBED_LOW_FIDELITY_TEXT_R
     return True
 
 
-@requires_dependencies("unstructured_inference")
-def process_page_layout_from_pdfminer(
+def extract_page_layout_from_pdfminer(
     annotation_list: list,
     page_layout,
     page_height: int | float,
@@ -472,9 +485,7 @@ def process_page_layout_from_pdfminer(
     coord_coef: float,
     pdfminer_config: Optional[PDFMinerConfig] = None,
     widget_list: Optional[list[dict[str, Any]]] = None,
-) -> tuple[LayoutElements, list]:
-    from unstructured_inference.inference.layoutelement import LayoutElements
-
+) -> PDFMinerPageData:
     urls_metadata: list[dict[str, Any]] = []
     element_coords, texts, element_class = [], [], []
     is_extracted = []
@@ -551,16 +562,48 @@ def process_page_layout_from_pdfminer(
         element_class.append(0)
         is_extracted.append(IsExtracted.TRUE)
 
+    return PDFMinerPageData(
+        width=float(page_layout.width),
+        height=float(page_height),
+        element_coords=coord_coef * np.array(element_coords),
+        texts=np.array(texts).astype(object),
+        element_class_ids=np.array(element_class),
+        is_extracted_array=np.array(is_extracted),
+        links=urls_metadata,
+    )
+
+
+@requires_dependencies("unstructured_inference")
+def process_page_layout_from_pdfminer(
+    annotation_list: list,
+    page_layout,
+    page_height: int | float,
+    page_number: int,
+    coord_coef: float,
+    pdfminer_config: Optional[PDFMinerConfig] = None,
+    widget_list: Optional[list[dict[str, Any]]] = None,
+) -> tuple[LayoutElements, list]:
+    from unstructured_inference.inference.layoutelement import LayoutElements
+
+    page_data = extract_page_layout_from_pdfminer(
+        annotation_list,
+        page_layout,
+        page_height,
+        page_number,
+        coord_coef,
+        pdfminer_config,
+        widget_list,
+    )
     return (
         LayoutElements(
-            element_coords=coord_coef * np.array(element_coords),
-            texts=np.array(texts).astype(object),
-            element_class_ids=np.array(element_class),
+            element_coords=page_data.element_coords,
+            texts=page_data.texts,
+            element_class_ids=page_data.element_class_ids,
             element_class_id_map={0: ElementType.UNCATEGORIZED_TEXT, 1: ElementType.IMAGE},
-            sources=np.array([Source.PDFMINER] * len(element_class)),
-            is_extracted_array=np.array(is_extracted),
+            sources=np.array([Source.PDFMINER] * len(page_data.element_class_ids)),
+            is_extracted_array=page_data.is_extracted_array,
         ),
-        urls_metadata,
+        page_data.links,
     )
 
 
@@ -572,42 +615,61 @@ def process_data_with_pdfminer(
     pdfminer_config: Optional[PDFMinerConfig] = None,
     rotation_corrections: Optional[List[int]] = None,
 ) -> tuple[List[LayoutElements], List[List]]:
-    """Loads the image and word objects from a pdf using pdfplumber and the image renderings of the
-    pdf pages using pdf2image
+    """Extract PDFMiner page data and convert it to the layout representation used by HI_RES."""
 
-    ``rotation_corrections`` is an optional per-page list of extra rotations (degrees,
-    counter-clockwise) that unstructured-inference applied to the rendered page images to
-    make their text upright. Mirroring those rotations onto the extracted coordinates keeps
-    the pdfminer layer aligned with the object-detection layer.
-    """
+    pages: list[PDFMinerPageData] = []
+    for page_number, (page, page_layout) in enumerate(
+        open_pdfminer_pages_generator(file, password=password, pdfminer_config=pdfminer_config)
+    ):
+        width, height = page_layout.width, page_layout.height
+        coordinate_system = PixelSpace(width=width, height=height)
+        annotation_list = (
+            get_uris(page.annots, height, coordinate_system, page_number) if page.annots else []
+        )
+        widget_list = get_widget_text_from_annots(page.annots, height) if page.annots else []
+        pages.append(
+            extract_page_layout_from_pdfminer(
+                annotation_list=annotation_list,
+                page_layout=page_layout,
+                page_height=height,
+                page_number=page_number,
+                coord_coef=1.0,
+                pdfminer_config=pdfminer_config,
+                widget_list=widget_list,
+            )
+        )
+
+    return process_pdfminer_page_data(
+        pages,
+        dpi=dpi,
+        rotation_corrections=rotation_corrections,
+    )
+
+
+@requires_dependencies("unstructured_inference")
+def process_pdfminer_page_data(
+    pages: list[PDFMinerPageData],
+    dpi: int = env_config.PDF_RENDER_DPI,
+    rotation_corrections: Optional[List[int]] = None,
+) -> tuple[List[LayoutElements], List[List]]:
+    """Convert compact PDFMiner page data into the layout representation used by HI_RES."""
 
     from unstructured_inference.inference.layoutelement import LayoutElements
 
     layouts = []
     layouts_links = []
-    # Coefficient to rescale bounding box to be compatible with images
     coef = dpi / 72
-    for page_number, (page, page_layout) in enumerate(
-        open_pdfminer_pages_generator(file, password=password, pdfminer_config=pdfminer_config)
-    ):
-        width, height = page_layout.width, page_layout.height
 
-        annotation_list = []
-        widget_list = []
-        coordinate_system = PixelSpace(
-            width=width,
-            height=height,
-        )
-        if page.annots:
-            annotation_list = get_uris(page.annots, height, coordinate_system, page_number)
-            widget_list = get_widget_text_from_annots(page.annots, height)
-
-        layout, urls_metadata = process_page_layout_from_pdfminer(
-            annotation_list, page_layout, height, page_number, coef, pdfminer_config, widget_list
+    for page_number, page_data in enumerate(pages):
+        layout = LayoutElements(
+            element_coords=coef * page_data.element_coords,
+            texts=page_data.texts.copy(),
+            element_class_ids=page_data.element_class_ids.copy(),
+            element_class_id_map={0: ElementType.UNCATEGORIZED_TEXT, 1: ElementType.IMAGE},
+            sources=np.array([Source.PDFMINER] * len(page_data.element_class_ids)),
+            is_extracted_array=page_data.is_extracted_array.copy(),
         )
 
-        # Mirror any image rotation unstructured-inference applied for this page so the
-        # extracted coordinates share the object-detection layer's frame (see _rotate_bboxes).
         angle = (
             rotation_corrections[page_number]
             if rotation_corrections is not None and page_number < len(rotation_corrections)
@@ -615,15 +677,21 @@ def process_data_with_pdfminer(
         )
         if angle:
             layout.element_coords = _rotate_bboxes(
-                layout.element_coords, angle, width * coef, height * coef
+                layout.element_coords,
+                angle,
+                page_data.width * coef,
+                page_data.height * coef,
             )
 
         links = []
-        for metadata in urls_metadata:
+        for metadata in page_data.links:
             bbox = [x * coef for x in metadata["bbox"]]
             if angle:
                 bbox = _rotate_bboxes(
-                    np.array([bbox], dtype=float), angle, width * coef, height * coef
+                    np.array([bbox], dtype=float),
+                    angle,
+                    page_data.width * coef,
+                    page_data.height * coef,
                 )[0].tolist()
             links.append(
                 {
@@ -650,15 +718,12 @@ def process_data_with_pdfminer(
             )
 
         layout = LayoutElements.concatenate(clean_layouts)
-        # NOTE(christine): always do the basic sort first for deterministic order across
-        # python versions.
         layout = sort_text_regions(layout, SORT_MODE_BASIC)
-
-        # apply the current default sorting to the layout elements extracted by pdfminer
         layout = sort_text_regions(layout)
 
         layouts.append(layout)
         layouts_links.append(links)
+
     return layouts, layouts_links
 
 

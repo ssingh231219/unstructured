@@ -231,6 +231,60 @@ def test_rotation_corrections_from_layout_defaults_to_zero_on_missing_metadata()
     assert pdf._rotation_corrections_from_layout(document_layout) == [0, 0, 0]
 
 
+def _mock_filename_hi_res_pipeline(monkeypatch, inferred_layout):
+    monkeypatch.setattr(layout, "process_file_with_model", lambda *a, **k: inferred_layout)
+    monkeypatch.setattr(
+        pdfminer_processing, "merge_inferred_with_extracted_layout", lambda **k: inferred_layout
+    )
+    monkeypatch.setattr(ocr, "process_file_with_ocr", lambda *a, **k: MockDocumentLayout())
+
+
+def test_partition_pdf_local_reuses_compact_pdfminer_pages(monkeypatch):
+    inferred_layout = _layout_with_rotation_corrections([{}])
+    _mock_filename_hi_res_pipeline(monkeypatch, inferred_layout)
+
+    cached_pages = [mock.sentinel.pdfminer_page]
+    cached_processor = mock.Mock(return_value=([], []))
+    fresh_processor = mock.Mock(side_effect=AssertionError("PDFMiner parsed the PDF twice"))
+    monkeypatch.setattr(pdfminer_processing, "process_pdfminer_page_data", cached_processor)
+    monkeypatch.setattr(pdfminer_processing, "process_file_with_pdfminer", fresh_processor)
+
+    pdf._partition_pdf_or_image_local(
+        filename=example_doc_path("pdf/layout-parser-paper-fast.pdf"),
+        pdf_text_extractable=True,
+        pdfminer_pages=cached_pages,
+        pdfminer_detect_vertical=False,
+    )
+
+    cached_processor.assert_called_once()
+    assert cached_processor.call_args.args == (cached_pages,)
+    assert cached_processor.call_args.kwargs["rotation_corrections"] == [0]
+    fresh_processor.assert_not_called()
+
+
+def test_partition_pdf_local_reextracts_when_vertical_text_setting_changes(monkeypatch):
+    inferred_layout = _layout_with_rotation_corrections(
+        [{"pdf_rotation": 90, "pdf_rotation_correction": 0}]
+    )
+    _mock_filename_hi_res_pipeline(monkeypatch, inferred_layout)
+
+    cached_processor = mock.Mock(return_value=([], []))
+    fresh_processor = mock.Mock(return_value=([], []))
+    monkeypatch.setattr(pdfminer_processing, "process_pdfminer_page_data", cached_processor)
+    monkeypatch.setattr(pdfminer_processing, "process_file_with_pdfminer", fresh_processor)
+
+    pdf._partition_pdf_or_image_local(
+        filename=example_doc_path("pdf/layout-parser-paper-fast.pdf"),
+        pdf_text_extractable=True,
+        pdfminer_pages=[mock.sentinel.pdfminer_page],
+        pdfminer_detect_vertical=False,
+    )
+
+    cached_processor.assert_not_called()
+    fresh_processor.assert_called_once()
+    assert fresh_processor.call_args.kwargs["pdfminer_config"].detect_vertical is True
+
+
 @pytest.mark.parametrize(
     ("file_arg", "model_target", "pdfminer_target"),
     [

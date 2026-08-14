@@ -18,6 +18,7 @@ from unstructured_inference.inference.layout import DocumentLayout, LayoutElemen
 from unstructured_inference.inference.layoutelement import LayoutElements
 
 from test_unstructured.unit_utils import example_doc_path
+from unstructured.partition import pdf
 from unstructured.partition.auto import partition
 from unstructured.partition.pdf_image.pdfminer_processing import (
     _deduplicate_ltchars,
@@ -29,6 +30,7 @@ from unstructured.partition.pdf_image.pdfminer_processing import (
     clean_pdfminer_inner_elements,
     get_widget_text_from_annots,
     process_file_with_pdfminer,
+    process_pdfminer_page_data,
     remove_duplicate_elements,
     text_is_embedded,
 )
@@ -338,6 +340,35 @@ def test_process_file_with_pdfminer():
     assert len(layout)
     assert "LayoutParser: A Uniﬁed Toolkit for Deep\n" in layout[0].texts
     assert links[0][0]["url"] == "https://layout-parser.github.io"
+
+
+def test_compact_pdfminer_page_data_matches_fresh_hi_res_extraction():
+    filename = example_doc_path("pdf/layout-parser-paper-fast.pdf")
+    fast_elements = pdf.extractable_elements(filename=filename)
+    extraction = pdf.extractable_elements(filename=filename, extract_pdfminer_pages=True)
+
+    def stable_element_dict(element):
+        element_dict = element.to_dict()
+        element_dict.pop("element_id")
+        return element_dict
+
+    assert [[stable_element_dict(el) for el in page] for page in extraction] == [
+        [stable_element_dict(el) for el in page] for page in fast_elements
+    ]
+    assert isinstance(extraction, pdf.PDFMinerExtractionResult)
+    assert extraction.pdfminer_pages is not None
+
+    cached_layouts, cached_links = process_pdfminer_page_data(extraction.pdfminer_pages)
+    fresh_layouts, fresh_links = process_file_with_pdfminer(filename)
+
+    assert cached_links == fresh_links
+    assert len(cached_layouts) == len(fresh_layouts)
+    for cached, fresh in zip(cached_layouts, fresh_layouts):
+        np.testing.assert_array_equal(cached.element_coords, fresh.element_coords)
+        np.testing.assert_array_equal(cached.texts, fresh.texts)
+        np.testing.assert_array_equal(cached.element_class_ids, fresh.element_class_ids)
+        np.testing.assert_array_equal(cached.sources, fresh.sources)
+        np.testing.assert_array_equal(cached.is_extracted_array, fresh.is_extracted_array)
 
 
 def test_process_file_with_pdfminer_is_extracted_array():

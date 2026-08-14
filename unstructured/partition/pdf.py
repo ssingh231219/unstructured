@@ -53,7 +53,9 @@ from unstructured.partition.common.common import (
 from unstructured.partition.common.lang import check_language_args, prepare_languages_for_tesseract
 from unstructured.partition.common.metadata import apply_metadata, get_last_modified_date
 from unstructured.partition.pdf_image.pdfminer_processing import (
+    PDFMinerPageData,
     check_annotations_within_element,
+    extract_page_layout_from_pdfminer,
     get_uris,
     get_widget_text_from_annots,
     get_words_from_obj,
@@ -106,6 +108,21 @@ TEXT_OPS_PATTERN = re.compile(
 )
 DEFAULT_MIN_FILE_SIZE_BYTES = 1 * 1024 * 1024  # 1 MB
 DEFAULT_MIN_RAW_STREAM_BYTES = 100_000  # 100 KB
+
+
+class PDFMinerExtractionResult(list[list[Element]]):
+    """FAST elements plus compact page data reusable by HI_RES."""
+
+    def __init__(
+        self,
+        elements: list[list[Element]],
+        pdfminer_pages: Optional[list[PDFMinerPageData]],
+        detect_vertical: bool,
+    ) -> None:
+        super().__init__(elements)
+        self.pdfminer_pages = pdfminer_pages
+        self.detect_vertical = detect_vertical
+
 
 # increase the max pixels so high dpi values like 300 can still be under the PIL limit
 PILImage.MAX_IMAGE_PIXELS = 5e8
@@ -298,6 +315,8 @@ def partition_pdf_or_image(
 
     extracted_elements: list[list[Element]] = []
     pdf_text_extractable = False
+    pdfminer_pages: Optional[list[PDFMinerPageData]] = None
+    pdfminer_detect_vertical = False
 
     if not is_image:
         try:
@@ -316,8 +335,20 @@ def partition_pdf_or_image(
                     starting_page_number=starting_page_number,
                     password=password,
                     pdfminer_config=pdfminer_config,
+                    extract_pdfminer_pages=strategy == PartitionStrategy.HI_RES
+                    or (
+                        strategy == PartitionStrategy.AUTO
+                        and (
+                            infer_table_structure
+                            or extract_images_in_pdf
+                            or bool(extract_image_block_types)
+                        )
+                    ),
                     **kwargs,
                 )
+                if isinstance(extracted_elements, PDFMinerExtractionResult):
+                    pdfminer_pages = extracted_elements.pdfminer_pages
+                    pdfminer_detect_vertical = extracted_elements.detect_vertical
                 pdf_text_extractable = any(
                     isinstance(el, Text) and el.text.strip()
                     for page_elements in extracted_elements
@@ -368,6 +399,8 @@ def partition_pdf_or_image(
                 form_extraction_skip_tables=form_extraction_skip_tables,
                 password=password,
                 pdfminer_config=pdfminer_config,
+                pdfminer_pages=pdfminer_pages,
+                pdfminer_detect_vertical=pdfminer_detect_vertical,
                 ocr_agent=ocr_agent,
                 table_ocr_agent=table_ocr_agent,
                 **kwargs,
@@ -411,6 +444,7 @@ def extractable_elements(
     starting_page_number: int = 1,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    extract_pdfminer_pages: bool = False,
     **kwargs: Any,
 ) -> list[list[Element]]:
     if isinstance(file, bytes):
@@ -423,6 +457,7 @@ def extractable_elements(
         starting_page_number=starting_page_number,
         password=password,
         pdfminer_config=pdfminer_config,
+        extract_pdfminer_pages=extract_pdfminer_pages,
         **kwargs,
     )
 
@@ -435,6 +470,7 @@ def _partition_pdf_with_pdfminer(
     starting_page_number: int = 1,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    extract_pdfminer_pages: bool = False,
     **kwargs: Any,
 ) -> list[list[Element]]:
     """Partitions a PDF using PDFMiner instead of using a layoutmodel. Used for faster
@@ -458,6 +494,7 @@ def _partition_pdf_with_pdfminer(
                 starting_page_number=starting_page_number,
                 password=password,
                 pdfminer_config=pdfminer_config,
+                extract_pdfminer_pages=extract_pdfminer_pages,
                 **kwargs,
             )
 
@@ -470,6 +507,7 @@ def _partition_pdf_with_pdfminer(
             starting_page_number=starting_page_number,
             password=password,
             pdfminer_config=pdfminer_config,
+            extract_pdfminer_pages=extract_pdfminer_pages,
             **kwargs,
         )
 
@@ -486,11 +524,13 @@ def _process_pdfminer_pages(
     starting_page_number: int = 1,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    extract_pdfminer_pages: bool = False,
     **kwargs,
 ) -> list[list[Element]]:
     """Uses PDFMiner to split a document into pages and process them."""
 
     elements = []
+    pdfminer_pages: Optional[list[PDFMinerPageData]] = [] if extract_pdfminer_pages else None
 
     for page_number, (page, page_layout) in enumerate(
         open_pdfminer_pages_generator(fp, password=password, pdfminer_config=pdfminer_config),
@@ -581,10 +621,27 @@ def _process_pdfminer_pages(
             element.metadata.detection_origin = "pdfminer"
             page_elements.append(element)
 
+        if pdfminer_pages is not None:
+            pdfminer_pages.append(
+                extract_page_layout_from_pdfminer(
+                    annotation_list=annotation_list,
+                    page_layout=page_layout,
+                    page_height=height,
+                    page_number=page_number,
+                    coord_coef=1.0,
+                    pdfminer_config=pdfminer_config,
+                    widget_list=widget_list,
+                )
+            )
+
         page_elements = _combine_list_elements(page_elements, coordinate_system)
         elements.append(page_elements)
 
-    return elements
+    return PDFMinerExtractionResult(
+        elements,
+        pdfminer_pages=pdfminer_pages,
+        detect_vertical=bool(pdfminer_config and pdfminer_config.detect_vertical),
+    )
 
 
 def _get_pdf_page_number(
@@ -802,6 +859,8 @@ def _partition_pdf_or_image_local(
     pdf_hi_res_max_pages: Optional[int] = None,
     password: Optional[str] = None,
     pdfminer_config: Optional[PDFMinerConfig] = None,
+    pdfminer_pages: Optional[list[PDFMinerPageData]] = None,
+    pdfminer_detect_vertical: bool = False,
     ocr_agent: str = OCR_AGENT_TESSERACT,
     table_ocr_agent: str = OCR_AGENT_TESSERACT,
     **kwargs: Any,
@@ -832,6 +891,7 @@ def _partition_pdf_or_image_local(
         merge_inferred_with_extracted_layout,
         process_data_with_pdfminer,
         process_file_with_pdfminer,
+        process_pdfminer_page_data,
     )
 
     hi_res_model_name = hi_res_model_name or model_name or default_hi_res_model()
@@ -876,17 +936,26 @@ def _partition_pdf_or_image_local(
             pdfminer_config,
         )
 
-        extracted_layout, layouts_links = (
-            process_file_with_pdfminer(
+        rotation_corrections = _rotation_corrections_from_layout(inferred_document_layout)
+        can_reuse_pdfminer = pdfminer_pages is not None and pdfminer_detect_vertical == bool(
+            pdfminer_config and pdfminer_config.detect_vertical
+        )
+        if not pdf_text_extractable:
+            extracted_layout, layouts_links = [], []
+        elif can_reuse_pdfminer:
+            extracted_layout, layouts_links = process_pdfminer_page_data(
+                pdfminer_pages,
+                dpi=pdf_image_dpi,
+                rotation_corrections=rotation_corrections,
+            )
+        else:
+            extracted_layout, layouts_links = process_file_with_pdfminer(
                 filename=filename,
                 dpi=pdf_image_dpi,
                 password=password,
                 pdfminer_config=pdfminer_config,
-                rotation_corrections=_rotation_corrections_from_layout(inferred_document_layout),
+                rotation_corrections=rotation_corrections,
             )
-            if pdf_text_extractable
-            else ([], [])
-        )
 
         if analysis:
             if not analyzed_image_output_dir_path:
@@ -938,17 +1007,26 @@ def _partition_pdf_or_image_local(
             pdfminer_config,
         )
 
-        extracted_layout, layouts_links = (
-            process_data_with_pdfminer(
+        rotation_corrections = _rotation_corrections_from_layout(inferred_document_layout)
+        can_reuse_pdfminer = pdfminer_pages is not None and pdfminer_detect_vertical == bool(
+            pdfminer_config and pdfminer_config.detect_vertical
+        )
+        if not pdf_text_extractable:
+            extracted_layout, layouts_links = [], []
+        elif can_reuse_pdfminer:
+            extracted_layout, layouts_links = process_pdfminer_page_data(
+                pdfminer_pages,
+                dpi=pdf_image_dpi,
+                rotation_corrections=rotation_corrections,
+            )
+        else:
+            extracted_layout, layouts_links = process_data_with_pdfminer(
                 file=file,
                 dpi=pdf_image_dpi,
                 password=password,
                 pdfminer_config=pdfminer_config,
-                rotation_corrections=_rotation_corrections_from_layout(inferred_document_layout),
+                rotation_corrections=rotation_corrections,
             )
-            if pdf_text_extractable
-            else ([], [])
-        )
 
         if analysis:
             if not analyzed_image_output_dir_path:
